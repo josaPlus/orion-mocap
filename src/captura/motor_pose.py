@@ -89,14 +89,29 @@ class MotorPose:
         """
         Detecta pose y dibuja el esqueleto.
 
+        MediaPipe produce DOS conjuntos de landmarks por frame:
+
+        pose_landmarks (landmarks de IMAGEN):
+          · x, y: posición normalizada 0-1 dentro del encuadre de la cámara.
+          · z: profundidad ESTIMADA, ruidosa, con escala diferente a x,y.
+          · Útil para: dibujar el esqueleto sobre el video 2D.
+          · NO es buena fuente para reconstrucción 3D (escala inconsistente).
+
+        pose_world_landmarks (landmarks de MUNDO):
+          · x, y, z: coordenadas 3D en METROS reales, escala uniforme en los
+            tres ejes, con el origen centrado en las caderas del actor.
+          · Mucho más estables y fiables para reconstrucción de rotaciones.
+          · Útil para: grabar y exportar a BVH.
+
         Parámetros
         ----------
         frame_bgr : np.ndarray  — frame de OpenCV (BGR)
 
         Retorna
         -------
-        frame_rgb : np.ndarray  — frame con esqueleto en RGB (listo para Pillow)
-        landmarks : list | None — 33 objetos landmark, o None si no hay persona
+        frame_rgb        : np.ndarray  — frame con esqueleto en RGB (para Pillow/Tkinter)
+        lm_imagen        : list | None — 33 landmarks de imagen (x,y normalizados)
+        lm_mundo         : list | None — 33 landmarks de mundo (x,y,z en metros)
         """
         # BGR → RGB (MediaPipe requiere RGB)
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -106,11 +121,22 @@ class MotorPose:
         resultado = self.pose.process(frame_rgb)
         frame_rgb.flags.writeable = True
 
-        landmarks = None
-        if resultado.pose_landmarks:
-            landmarks = resultado.pose_landmarks.landmark
+        lm_imagen = None
+        lm_mundo  = None
 
-            # Dibujamos conexiones con el estilo por defecto de MediaPipe
+        if resultado.pose_landmarks:
+            # Landmarks de imagen: usamos para dibujar y para la UI
+            lm_imagen = resultado.pose_landmarks.landmark
+
+            # Landmarks de mundo: los extraemos si están disponibles.
+            # pose_world_landmarks puede ser None en raras condiciones
+            # (modelo con complejidad 0 o frame muy parcial), así que
+            # comprobamos antes de acceder.
+            if resultado.pose_world_landmarks:
+                lm_mundo = resultado.pose_world_landmarks.landmark
+
+            # El esqueleto se dibuja SIEMPRE con los landmarks de imagen,
+            # porque corresponden a las posiciones dentro del encuadre 2D.
             self._mp_dibujo.draw_landmarks(
                 frame_rgb,
                 resultado.pose_landmarks,
@@ -118,7 +144,7 @@ class MotorPose:
                 self._mp_estilos.get_default_pose_landmarks_style(),
             )
 
-        return frame_rgb, landmarks
+        return frame_rgb, lm_imagen, lm_mundo
 
     def liberar(self):
         """Cierra el detector y libera memoria de MediaPipe."""

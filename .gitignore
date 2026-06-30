@@ -8,3 +8,7 @@ datos/salidas_bvh/
 # Cache de Python
 __pycache__/
 *.pyc
+
+# archivos JSON y BVH
+grabaciones/*.json
+grabaciones/*.bvh

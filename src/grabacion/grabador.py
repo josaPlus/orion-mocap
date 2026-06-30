@@ -74,8 +74,16 @@ class Grabador:
         """
         Añade un frame a la sesión actual.
 
-        landmarks puede ser None (frame sin persona detectada);
-        igual se guarda para mantener la línea de tiempo continua.
+        Parámetros
+        ----------
+        landmarks : list | None
+            Lista de 33 landmarks de MUNDO (pose_world_landmarks de MediaPipe).
+            Coordenadas en METROS, escala uniforme en x,y,z, origen en caderas.
+            Se reciben así desde app.py porque son la fuente correcta para BVH.
+            Vale None cuando MediaPipe no detectó persona en este frame; igual
+            se guarda el frame vacío para mantener la línea de tiempo continua.
+        numero_frame : int
+            Número de frame acumulado de la sesión (para referencia).
         """
         if not self._activo:
             return

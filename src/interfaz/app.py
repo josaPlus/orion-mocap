@@ -116,22 +116,33 @@ class App:
         exito, frame_bgr = self._camara.read()
 
         if exito:
-            # Procesamos el frame con MediaPipe
-            frame_rgb, landmarks = self._motor.procesar_frame(frame_bgr)
+            # Procesamos el frame con MediaPipe.
+            # El motor ahora devuelve TRES valores:
+            #   frame_rgb  → video con esqueleto dibujado (para mostrar en pantalla)
+            #   lm_imagen  → landmarks de imagen (x,y 0-1): para la UI y el mini-esqueleto
+            #   lm_mundo   → landmarks de mundo (x,y,z en metros): para grabar y exportar BVH
+            frame_rgb, lm_imagen, lm_mundo = self._motor.procesar_frame(frame_bgr)
 
-            # Actualizamos el panel de video
+            # El video siempre usa el frame con el esqueleto ya dibujado
             self._panel_video.actualizar(frame_rgb)
 
-            # Si estamos grabando, añadimos el frame al grabador
+            # Al grabador le pasamos los landmarks de MUNDO, no los de imagen.
+            # Razón: los world_landmarks tienen escala uniforme en los tres ejes
+            # (metros reales, origen en caderas), lo que permite reconstruir
+            # rotaciones de huesos sin hacks de escalado. Los landmarks de
+            # imagen distorsionan la profundidad y deforman el esqueleto en BVH.
             if self._grabador.activo:
-                self._grabador.agregar_frame(landmarks, self._num_frame)
+                self._grabador.agregar_frame(lm_mundo, self._num_frame)
 
-            # Actualizamos landmarks en el panel de control
-            self._panel_control.actualizar_landmarks(landmarks)
+            # La UI (panel de control) sigue usando los de imagen para mostrar
+            # el mini-esqueleto 2D y la tabla de coordenadas, ya que esos
+            # valores corresponden al espacio de la cámara, no al espacio 3D.
+            self._panel_control.actualizar_landmarks(lm_imagen)
 
             # Calculamos FPS suavizado
             self._fps_actual = self._calcular_fps()
-            detectado = landmarks is not None
+            # La detección se considera exitosa si hay landmarks de imagen
+            detectado = lm_imagen is not None
 
             # Actualizamos todos los indicadores del panel de control
             self._panel_control.actualizar_estado(

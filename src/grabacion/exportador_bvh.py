@@ -93,9 +93,34 @@ def _recorrido_dfs(nombre, lista):
 ORDEN_JOINTS = []
 _recorrido_dfs("Hips", ORDEN_JOINTS)
 
-# Escala de conversión: de coordenadas normalizadas de MediaPipe (0-1)
-# a centímetros aproximados. Ajusta este valor si el tamaño se ve mal en Blender.
-ESCALA_CM = 150.0
+# ---------------------------------------------------------------------------
+# Constantes de escala y suavizado — AJUSTA AQUÍ si algo se ve mal
+# ---------------------------------------------------------------------------
+
+# ESCALA_CM: factor de conversión de metros (world_landmarks) a centímetros.
+#
+# Antes usábamos coordenadas de IMAGEN (x,y normalizados 0-1, z estimada),
+# lo que obligaba a hacks de escalado separado por eje porque los ejes
+# no tenían la misma escala entre sí.
+#
+# Ahora usamos world_landmarks, que ya están en METROS REALES con escala
+# uniforme en x, y y z. Por eso usamos UNA sola constante para los tres ejes:
+#   metros × 100 = centímetros
+# Esto respeta las proporciones reales del cuerpo sin ningún hack.
+#
+# Si el personaje sale demasiado PEQUEÑO en Blender: sube este valor (p. ej. 120).
+# Si sale demasiado GRANDE: bájalo (p. ej. 80).
+# El valor 100 es correcto para unidades estándar (1 cm = 1 unidad de Blender
+# con la escala de escena en 0.01, que es la configuración recomendada para BVH).
+ESCALA_CM = 100.0   # metros → centímetros; ajusta solo si el tamaño se ve mal
+
+# VENTANA_SUAVIZADO: cuántos frames vecinos se promedian para suavizar
+# el jitter (temblor) de cada landmark.
+#   1  → sin suavizado (comportamiento original, máxima respuesta)
+#   5  → suavizado moderado, recomendado para movimientos lentos/medios
+#   11 → suavizado agresivo; puede "retrasar" visualmente la animación
+# Solo se promedian frames que sí tuvieron detección (no se inventan datos).
+VENTANA_SUAVIZADO = 5
 
 
 class _Punto:
@@ -160,11 +185,29 @@ def _rotacion_entre_vectores(origen, destino):
 # ---------------------------------------------------------------------------
 
 def _convertir_a_mundo(lm):
-    """MediaPipe: x,y en 0-1 (y crece hacia abajo); z = profundidad relativa."""
+    """
+    Convierte un world_landmark de MediaPipe a coordenadas de mundo en cm.
+
+    Ejes de pose_world_landmarks:
+      x: metros, positivo hacia la derecha del actor
+      y: metros, positivo hacia ABAJO (convención de imagen, no 3D estándar)
+      z: metros, positivo hacia la cámara (el actor que se acerca = z positivo)
+      Origen: centro de las caderas del actor en el frame actual.
+
+    Conversión a BVH (Y arriba, Z adelante, origen en caderas):
+      X = lm.x * ESCALA_CM   → metros a cm, mismo sentido (derecha = +X)
+      Y = -lm.y * ESCALA_CM  → negamos para que Y apunte ARRIBA (BVH estándar)
+      Z = -lm.z * ESCALA_CM  → negamos para que "adelante" sea +Z en BVH
+
+    Importante: ya NO hay "(lm.x - 0.5)" ni centrado manual, porque los
+    world_landmarks ya tienen el origen en las caderas (centrado por MediaPipe).
+    Ya NO hay escala separada por eje, porque los tres ejes ya tienen la
+    misma escala real (metros), así que un solo factor es correcto.
+    """
     return np.array([
-        (lm.x - 0.5) * ESCALA_CM,
-        -(lm.y - 0.5) * ESCALA_CM,
-        -lm.z * ESCALA_CM,
+         lm.x * ESCALA_CM,   # x: metros → cm, sin cambio de signo
+        -lm.y * ESCALA_CM,   # y: invertimos para Y arriba (convención BVH)
+        -lm.z * ESCALA_CM,   # z: invertimos (MediaPipe z+ = hacia cámara → BVH z- = atrás)
     ])
 
 
@@ -300,6 +343,97 @@ def _escribir_hueso(nombre, nivel, lineas):
 
 
 # ---------------------------------------------------------------------------
+# Suavizado temporal de landmarks
+# ---------------------------------------------------------------------------
+
+def _suavizar_landmarks(frames: list, ventana: int) -> list:
+    """
+    Aplica una media móvil centrada sobre las posiciones (x, y, z) de cada
+    landmark a lo largo del tiempo, para reducir el jitter de MediaPipe.
+
+    Por qué hace falta:
+        MediaPipe emite coordenadas que tiemblan ligeramente frame a frame
+        (ruido de detección). Sin suavizado, ese jitter se convierte en
+        rotaciones de huesos que vibran visiblemente en la animación.
+
+    Cómo funciona:
+        Para cada landmark L y frame F, calculamos la posición suavizada
+        promediando los frames [F - ventana//2 … F + ventana//2] que SÍ
+        contienen a L. Los frames vacíos (sin detección) se saltan, así
+        nunca "inventamos" una posición donde MediaPipe no detectó nada.
+
+    Parámetros
+    ----------
+    frames  : lista original de frames (no se modifica en el sitio)
+    ventana : número de frames a promediar; 1 = sin suavizado
+
+    Retorna
+    -------
+    Nueva lista de frames con los mismos campos pero con x,y,z suavizados.
+    """
+    if ventana <= 1:
+        # Suavizado desactivado: devolvemos los datos sin tocar
+        return frames
+
+    n = len(frames)
+    radio = ventana // 2   # cuántos frames a cada lado del frame central
+
+    # --- Paso 1: extraer posiciones por índice de landmark a lo largo del tiempo ---
+    # Construimos un dict: indice_landmark → lista de (frame_idx, x, y, z)
+    # Solo añadimos entradas donde ese landmark estaba presente.
+    posiciones_por_lm: dict[int, list] = {}
+    for fi, fr in enumerate(frames):
+        for lm in fr.get("landmarks", []):
+            idx = lm["indice"]
+            if idx not in posiciones_por_lm:
+                posiciones_por_lm[idx] = []
+            posiciones_por_lm[idx].append((fi, lm["x"], lm["y"], lm["z"]))
+
+    # --- Paso 2: para cada landmark, construir tabla de posición suavizada ---
+    # Guardamos el resultado en un dict: (frame_idx, lm_idx) → (x_s, y_s, z_s)
+    suavizados: dict[tuple, tuple] = {}
+    for lm_idx, apariciones in posiciones_por_lm.items():
+        # `apariciones` está ordenada por frame_idx (se añadió en orden)
+        m = len(apariciones)
+        for j, (fi, _, _, _) in enumerate(apariciones):
+            # Ventana: tomamos los índices dentro de la lista `apariciones`
+            # que estén dentro de ±radio frames del frame fi.
+            # Así evitamos cruzar frames vacíos con frames reales.
+            inicio = j
+            while inicio > 0 and fi - apariciones[inicio - 1][0] <= radio:
+                inicio -= 1
+            fin = j
+            while fin < m - 1 and apariciones[fin + 1][0] - fi <= radio:
+                fin += 1
+
+            # Promediamos x, y, z de los vecinos encontrados
+            vecinos = apariciones[inicio: fin + 1]
+            x_s = sum(v[1] for v in vecinos) / len(vecinos)
+            y_s = sum(v[2] for v in vecinos) / len(vecinos)
+            z_s = sum(v[3] for v in vecinos) / len(vecinos)
+            suavizados[(fi, lm_idx)] = (x_s, y_s, z_s)
+
+    # --- Paso 3: reconstruir la lista de frames con las posiciones suavizadas ---
+    nuevos_frames = []
+    for fi, fr in enumerate(frames):
+        landmarks_suavizados = []
+        for lm in fr.get("landmarks", []):
+            clave = (fi, lm["indice"])
+            if clave in suavizados:
+                xs, ys, zs = suavizados[clave]
+                # Copiamos el landmark pero reemplazamos x,y,z suavizados.
+                # El resto de campos (nombre, visibilidad…) se conservan.
+                landmarks_suavizados.append({**lm, "x": xs, "y": ys, "z": zs})
+            else:
+                landmarks_suavizados.append(lm)
+
+        # Copiamos el frame entero; solo cambia la lista de landmarks
+        nuevos_frames.append({**fr, "landmarks": landmarks_suavizados})
+
+    return nuevos_frames
+
+
+# ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
 
@@ -328,6 +462,10 @@ def exportar_bvh(frames: list, ruta_salida: str, fps: float = 30.0) -> str:
     """
     lineas_jerarquia = ["HIERARCHY"]
     _escribir_hueso("Hips", 0, lineas_jerarquia)
+
+    # Suavizamos los landmarks ANTES de reconstruir rotaciones.
+    # Esto reduce el jitter sin cambiar la jerarquía ni el formato de salida.
+    frames = _suavizar_landmarks(frames, VENTANA_SUAVIZADO)
 
     lineas_movimiento = []
     ultima_pos = None
