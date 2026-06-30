@@ -1,11 +1,16 @@
 """
 grabador.py — Módulo de grabación de sesiones de motion capture.
 
-Guarda los datos de pose (33 landmarks por frame) en JSON.
+Guarda los datos de pose (33 landmarks por frame) en dos formatos:
+  · JSON — datos crudos completos, útil para depurar o procesar a mano
+  · BVH  — esqueleto con jerarquía y rotaciones, listo para importar en
+           Blender, Unity, Unreal Engine o Maya
+
 No sabe nada de Tkinter ni de OpenCV; solo maneja datos y archivos.
 
-Formato de archivo:
+Formato de archivos:
     grabaciones/{nombre_sesion}_{YYYYMMDD_HHMMSS}.json
+    grabaciones/{nombre_sesion}_{YYYYMMDD_HHMMSS}.bvh
 """
 
 import json
@@ -13,6 +18,7 @@ import os
 import time
 from datetime import datetime
 from src.captura.motor_pose import NOMBRES_LANDMARKS
+from src.grabacion.exportador_bvh import exportar_bvh
 
 # Carpeta donde se guardan las sesiones, relativa a la raíz del proyecto
 CARPETA_GRABACIONES = os.path.join(
@@ -98,26 +104,45 @@ class Grabador:
             "landmarks": puntos,
         })
 
-    def detener(self) -> str:
+    def detener(self) -> dict:
         """
-        Detiene la grabación, guarda el JSON y retorna la ruta del archivo.
-        Retorna "" si no había ninguna grabación activa.
+        Detiene la grabación y guarda los archivos JSON + BVH.
+
+        Retorna
+        -------
+        dict con claves "json" y "bvh" (rutas de archivo).
+        "bvh" queda en "" si no se pudo generar (p. ej. no hubo
+        ningún frame con detección válida). Retorna {} si no había
+        ninguna grabación activa.
         """
         if not self._activo:
-            return ""
+            return {}
 
         self._activo = False
-        ruta = self._guardar()
-        return ruta
+        ruta_json = self._guardar_json()
+
+        ruta_bvh = ""
+        try:
+            ruta_bvh = exportar_bvh(
+                self._frames,
+                os.path.splitext(ruta_json)[0] + ".bvh",
+                fps=self._fps_estimado(),
+            )
+        except ValueError as e:
+            # No hubo suficiente detección de pose para generar el esqueleto;
+            # el JSON ya quedó guardado de todas formas.
+            print(f"[Orion] Aviso: {e}")
+
+        return {"json": ruta_json, "bvh": ruta_bvh}
 
     def listar_grabaciones(self) -> list[dict]:
         """
-        Devuelve lista de dicts con info de cada archivo guardado,
-        ordenados del más reciente al más antiguo.
+        Devuelve lista de dicts con info de cada archivo guardado
+        (.json y .bvh), ordenados del más reciente al más antiguo.
         """
         archivos = []
         for nombre in os.listdir(CARPETA_GRABACIONES):
-            if not nombre.endswith(".json"):
+            if not (nombre.endswith(".json") or nombre.endswith(".bvh")):
                 continue
             ruta = os.path.join(CARPETA_GRABACIONES, nombre)
             tam_kb = os.path.getsize(ruta) / 1024
@@ -134,7 +159,16 @@ class Grabador:
     # Internos
     # ------------------------------------------------------------------
 
-    def _guardar(self) -> str:
+    def _fps_estimado(self) -> float:
+        """Estima los fps reales de la grabación a partir de sus timestamps."""
+        if len(self._frames) < 2:
+            return 30.0
+        duracion = self._frames[-1]["timestamp"]
+        if duracion <= 0:
+            return 30.0
+        return len(self._frames) / duracion
+
+    def _guardar_json(self) -> str:
         marca = datetime.now().strftime("%Y%m%d_%H%M%S")
         nombre_archivo = f"{self._nombre}_{marca}.json"
         ruta = os.path.join(CARPETA_GRABACIONES, nombre_archivo)

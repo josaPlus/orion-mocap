@@ -14,6 +14,7 @@ Los paneles y el grabador no se conocen directamente.
 import tkinter as tk
 from tkinter import messagebox
 import cv2
+import os
 import time
 
 import src.interfaz.estilos as E
@@ -157,11 +158,19 @@ class App:
         self._grabador.iniciar(nombre_sesion)
 
     def _detener_grabacion(self):
-        ruta = self._grabador.detener()
-        if ruta:
-            self._panel_control.agregar_sesion(ruta)
-            self._lbl_estado_barra.configure(
-                text=f"Guardado: {ruta}", fg=E.ACENTO_VERDE)
+        resultado = self._grabador.detener()
+        ruta_json = resultado.get("json", "")
+        ruta_bvh  = resultado.get("bvh", "")
+
+        if ruta_json:
+            self._panel_control.agregar_sesion(ruta_json)
+            texto = f"Guardado: {os.path.basename(ruta_json)}"
+            if ruta_bvh:
+                self._panel_control.agregar_sesion(ruta_bvh)
+                texto += f"  +  {os.path.basename(ruta_bvh)} (listo para Blender/Unity)"
+            else:
+                texto += "  (sin BVH: no hubo suficiente detección de pose)"
+            self._lbl_estado_barra.configure(text=texto, fg=E.ACENTO_VERDE)
 
     # ==================================================================
     # Barra de estado inferior
