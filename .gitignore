@@ -1,0 +1,10 @@
+# Entorno virtual
+venv/
+
+# Datos pesados (videos y salidas)
+datos/videos_entrada/
+datos/salidas_bvh/
+
+# Cache de Python
+__pycache__/
+*.pyc
